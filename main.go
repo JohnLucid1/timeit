@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/gizak/termui/v3"
+	"github.com/gizak/termui/v3/widgets"
 )
 
 const (
@@ -36,6 +39,12 @@ func process(iter int, url string) ([]Response, error) {
 	barWidth := 50
 	progress := 0
 
+	// Initial sleep time in milliseconds (e.g., 1000ms = 1 second)
+	initialSleep := 1000.0
+
+	// Track the start time of the entire process to calculate requests per second
+	startTime := time.Now()
+
 	for i := 0; i < totalRequests; i++ {
 		start := time.Now()
 
@@ -50,10 +59,10 @@ func process(iter int, url string) ([]Response, error) {
 			})
 			continue
 		}
-		defer resp.Body.Close()
 
 		// Read the body to get the size
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close() // Close the response body after reading
 		if err != nil {
 			results = append(results, Response{
 				TimeMillis: int(time.Since(start).Milliseconds()),
@@ -64,8 +73,10 @@ func process(iter int, url string) ([]Response, error) {
 			continue
 		}
 
+		// Track the time taken and store the response
+		elapsed := time.Since(start).Milliseconds()
 		results = append(results, Response{
-			TimeMillis: int(time.Since(start).Milliseconds()),
+			TimeMillis: int(elapsed),
 			Code:       resp.StatusCode,
 			Bytes:      len(body),
 			Date:       time.Now(),
@@ -82,15 +93,22 @@ func process(iter int, url string) ([]Response, error) {
 		// Print progress bar
 		fmt.Printf("\rProgress: %s %.2f%% (%d/%d)", bar, percentage, progress, totalRequests)
 
-		// Simulate some delay between requests to avoid overwhelming the server
-		// time.Sleep(100 * time.Millisecond)
-		time.Sleep(time.Millisecond * time.Duration((i*50 - (i * i))))
+		// Reduce sleep duration progressively
+		sleepTime := initialSleep / math.Sqrt(float64(progress))
+		if sleepTime < 1 {
+			sleepTime = 1 // Ensure there's at least a 1 millisecond delay
+		}
+		time.Sleep(time.Duration(sleepTime) * time.Millisecond)
 	}
 
 	// Print a newline after the progress bar is complete
 	fmt.Println()
 
-	requestsPerSecond := float64(totalRequests) / float64(iter)
+	// Calculate the total elapsed time
+	totalElapsedTime := time.Since(startTime).Seconds()
+
+	// Calculate requests per second for the entire operation
+	requestsPerSecond := float64(totalRequests) / totalElapsedTime
 
 	// Add requests per second to each response
 	for i := range results {
@@ -100,11 +118,78 @@ func process(iter int, url string) ([]Response, error) {
 	return results, nil
 }
 
+func createPlot(global []MainData) {
+	if err := termui.Init(); err != nil {
+		fmt.Println("failed to initialize termui:", err)
+		return
+	}
+	defer termui.Close()
+
+	// Prepare data for the plot
+	var dataSeries []float64
+	var labels []string
+	var colors []termui.Color
+	var totalResponseTime int
+	var totalRequests int
+	non200Requests := 0
+	non200RequestsPerSecond := 0.0
+
+	for _, data := range global {
+		for _, response := range data.Data {
+			dataSeries = append(dataSeries, float64(response.TimeMillis))
+			labels = append(labels, fmt.Sprintf("%d", response.Code))
+			colors = append(colors, termui.ColorWhite) // Always white for response time
+
+			// Accumulate total response time and count requests
+			totalResponseTime += response.TimeMillis
+			totalRequests++
+
+			if response.Code != 200 {
+				non200Requests++
+				non200RequestsPerSecond += response.RequestsPerSecond / float64(len(global))
+			}
+		}
+	}
+
+	// Calculate average response time
+	averageResponseTime := float64(totalResponseTime) / float64(totalRequests)
+
+	// Create a bar chart
+	barChart := widgets.NewBarChart()
+	barChart.Data = dataSeries
+	barChart.Labels = labels
+	barChart.BarColors = colors
+	barChart.LabelStyles = make([]termui.Style, len(labels))
+
+	// Set all label styles to white
+	for i := range barChart.LabelStyles {
+		barChart.LabelStyles[i] = termui.NewStyle(termui.ColorWhite)
+	}
+
+	barChart.Title = "Response Time vs Number of Requests"
+	barChart.SetRect(0, 0, 100, 20)
+
+	// Prepare the summary to be displayed
+	summary := widgets.NewParagraph()
+	summary.Text = fmt.Sprintf("Average Response Time: %.2f ms\nNon-200 Status Codes: %d requests\nRequests per Second for Non-200 Codes: %.2f", averageResponseTime, non200Requests, non200RequestsPerSecond)
+	summary.SetRect(0, 20, 100, 25)
+
+	termui.Render(barChart, summary)
+
+	uiEvents := termui.PollEvents()
+	for {
+		e := <-uiEvents
+		if e.Type == termui.KeyboardEvent {
+			break
+		}
+	}
+}
+
 func main() {
-	// url := "http://example.com"
-	// amount := 3
 	url := flag.String("u", "", "Website url to benchmark")
 	amount := flag.Int("a", 3, "Iteration over requests (1 -> 100 requests, 2 -> 200 requests)")
+
+	flag.Parse()
 
 	var global []MainData
 
@@ -112,7 +197,6 @@ func main() {
 		newData := MainData{}
 
 		data, err := process(i, *url)
-		fmt.Println(data)
 		if err != nil {
 			fmt.Println("Error during processing:", err)
 			continue
@@ -123,5 +207,5 @@ func main() {
 		global = append(global, newData)
 	}
 
-	fmt.Println(global)
+	createPlot(global)
 }
