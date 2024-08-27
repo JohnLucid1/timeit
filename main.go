@@ -1,131 +1,127 @@
 package main
 
 import (
-	"encoding/csv"
 	"flag"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
-	"os"
-	"path"
-	"strconv"
-	"sync"
+	"strings"
 	"time"
 )
 
-const DATA_PATH string = "site_data"
+const (
+	dataPath = "data"
+)
 
-// TODO: check if the response time is too long of its an error(and if so write it and close thread)
-/* TODO
-https://fineproxy.org/ru/free-proxies/europe/russia/,
-parse them
-get all the best proxies
-and then use the proxies to get  the results
-*/
+type MainData struct {
+	Iteration int
+	Data      []Response
+	Url       string
+}
 
 type Response struct {
-	Time_mills int
-	Bytes      int
-	Code       int
-	Date       time.Time
+	TimeMillis        int
+	Bytes             int
+	Code              int
+	Date              time.Time
+	RequestsPerSecond float64
 }
 
-func request(wg *sync.WaitGroup, url string, ch chan Response) {
-	defer wg.Done()
-
-	start_time := time.Now()
-	resp, err := http.Get(url)
-	if err != nil {
-		fmt.Println("ERROR: ", err)
-	}
-
-	defer resp.Body.Close()
-	elapsed := time.Since(start_time)
-	ch <- Response{
-		Time_mills: int(elapsed),
-		Code:       resp.StatusCode,
-		Bytes:      int(resp.ContentLength),
-		Date:       time.Now(),
-	}
-}
-
-func process(iter int, url string) error {
+func process(iter int, url string) ([]Response, error) {
 	results := []Response{}
+	totalRequests := iter * 100
 
-	var wg sync.WaitGroup
+	// Calculate the width of the progress bar
+	barWidth := 50
+	progress := 0
 
-	ch := make(chan Response, iter*100)
+	for i := 0; i < totalRequests; i++ {
+		start := time.Now()
 
-	for i := 0; i < iter*100; i++ {
-		wg.Add(1)
-		go request(&wg, url, ch)
+		// Make the request
+		resp, err := http.Get(url)
+		if err != nil {
+			results = append(results, Response{
+				TimeMillis: int(time.Since(start).Milliseconds()),
+				Code:       0, // Error code
+				Bytes:      0,
+				Date:       time.Now(),
+			})
+			continue
+		}
+		defer resp.Body.Close()
+
+		// Read the body to get the size
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			results = append(results, Response{
+				TimeMillis: int(time.Since(start).Milliseconds()),
+				Code:       resp.StatusCode,
+				Bytes:      0,
+				Date:       time.Now(),
+			})
+			continue
+		}
+
+		results = append(results, Response{
+			TimeMillis: int(time.Since(start).Milliseconds()),
+			Code:       resp.StatusCode,
+			Bytes:      len(body),
+			Date:       time.Now(),
+		})
+
+		// Update progress
+		progress = i + 1
+		percentage := float64(progress) / float64(totalRequests) * 100
+
+		// Calculate filled portion
+		filled := int(math.Round(float64(barWidth) * percentage / 100))
+		bar := "[" + strings.Repeat("x", filled) + strings.Repeat(" ", barWidth-filled) + "]"
+
+		// Print progress bar
+		fmt.Printf("\rProgress: %s %.2f%% (%d/%d)", bar, percentage, progress, totalRequests)
+
+		// Simulate some delay between requests to avoid overwhelming the server
+		// time.Sleep(100 * time.Millisecond)
 		time.Sleep(time.Millisecond * time.Duration((i*50 - (i * i))))
 	}
 
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
+	// Print a newline after the progress bar is complete
+	fmt.Println()
 
-	for response := range ch {
-		results = append(results, response)
+	requestsPerSecond := float64(totalRequests) / float64(iter)
+
+	// Add requests per second to each response
+	for i := range results {
+		results[i].RequestsPerSecond = requestsPerSecond
 	}
 
-	if err := write_csv(&results, strconv.Itoa(iter)); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func write_csv(reponses *[]Response, iter string) error {
-	file_path := path.Join(DATA_PATH, "/", fmt.Sprintf("%s%s",iter, "data.csv"))
-	file, err := os.Create(file_path)
-	if err != nil {
-		fmt.Println("ERROR: ", err)
-		return err
-	}
-
-	defer file.Close()
-	writer := csv.NewWriter(file)
-
-	defer writer.Flush()
-
-	// headers := []string{"date", "response time", "status code", "bytes"}
-	// if err := writer.Write(headers); err != nil {
-		// fmt.Println("ERROR WRITING TO FILE: ", err)
-		// return err
-	// }
-
-	for _, v := range *reponses {
-		record := []string{
-			strconv.Itoa(int(v.Date.Unix())),
-			strconv.Itoa(v.Time_mills),
-			strconv.Itoa(v.Code),
-			strconv.Itoa(v.Bytes),
-		}
-		if err := writer.Write(record); err != nil {
-			fmt.Println("ERROR WRITING CSV TO FILE", err)
-			return err
-		}
-	}
-	return nil
+	return results, nil
 }
 
 func main() {
-	err := os.Mkdir(DATA_PATH, 0666)
-	if err != nil {
-		panic(err)
-	}
+	// url := "http://example.com"
+	// amount := 3
+	url := flag.String("u", "", "Website url to benchmark")
+	amount := flag.Int("a", 3, "Iteration over requests (1 -> 100 requests, 2 -> 200 requests)")
 
-	url := flag.String("u", "", "URL which you are stress tasting")
-	amount := flag.Int("a", 1, "Amount of hundreds of times to run")
-
-	flag.Parse()
+	var global []MainData
 
 	for i := 1; i <= *amount; i++ {
-		err := process(i, *url)
+		newData := MainData{}
+
+		data, err := process(i, *url)
+		fmt.Println(data)
 		if err != nil {
-			fmt.Println("SOMETHING WENT SHIT", err)
+			fmt.Println("Error during processing:", err)
+			continue
 		}
+		newData.Data = data
+		newData.Iteration = i
+		newData.Url = *url
+		global = append(global, newData)
 	}
+
+	fmt.Println(global)
 }
