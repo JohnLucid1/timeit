@@ -6,7 +6,10 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gizak/termui/v3"
@@ -14,13 +17,13 @@ import (
 )
 
 const (
-	dataPath = "data"
+	PORTION = 100
 )
 
-type MainData struct {
+type Data struct {
 	Iteration int
 	Data      []Response
-	Url       string
+	URL       string
 }
 
 type Response struct {
@@ -45,7 +48,7 @@ func process(iter int, url string) ([]Response, error) {
 	// Track the start time of the entire process to calculate requests per second
 	startTime := time.Now()
 
-	for i := 0; i < totalRequests; i++ {
+	for i := range totalRequests {
 		start := time.Now()
 
 		// Make the request
@@ -57,6 +60,7 @@ func process(iter int, url string) ([]Response, error) {
 				Bytes:      0,
 				Date:       time.Now(),
 			})
+
 			continue
 		}
 
@@ -70,6 +74,7 @@ func process(iter int, url string) ([]Response, error) {
 				Bytes:      0,
 				Date:       time.Now(),
 			})
+
 			continue
 		}
 
@@ -87,7 +92,7 @@ func process(iter int, url string) ([]Response, error) {
 		percentage := float64(progress) / float64(totalRequests) * 100
 
 		// Calculate filled portion
-		filled := int(math.Round(float64(barWidth) * percentage / 100))
+		filled := int(math.Round(float64(barWidth) * percentage / PORTION))
 		bar := "[" + strings.Repeat("x", filled) + strings.Repeat(" ", barWidth-filled) + "]"
 
 		// Print progress bar
@@ -118,12 +123,23 @@ func process(iter int, url string) ([]Response, error) {
 	return results, nil
 }
 
-func createPlot(global []MainData) {
+func createPlot(global []Data) {
 	if err := termui.Init(); err != nil {
 		fmt.Println("failed to initialize termui:", err)
+
 		return
 	}
 	defer termui.Close()
+
+	// Prepare data for the plot, sorting responses by Date
+	allResponses := make([]Response, 0)
+	for _, data := range global {
+		allResponses = append(allResponses, data.Data...)
+	}
+
+	sort.Slice(allResponses, func(i, j int) bool {
+		return allResponses[i].Date.Before(allResponses[j].Date)
+	})
 
 	// Prepare data for the plot
 	var dataSeries []float64
@@ -137,14 +153,14 @@ func createPlot(global []MainData) {
 	for _, data := range global {
 		for _, response := range data.Data {
 			dataSeries = append(dataSeries, float64(response.TimeMillis))
-			labels = append(labels, fmt.Sprintf("%d", response.Code))
+			labels = append(labels, strconv.Itoa(response.Code))
 			colors = append(colors, termui.ColorWhite) // Always white for response time
 
 			// Accumulate total response time and count requests
 			totalResponseTime += response.TimeMillis
 			totalRequests++
 
-			if response.Code != 200 {
+			if response.Code != http.StatusOK {
 				non200Requests++
 				non200RequestsPerSecond += response.RequestsPerSecond / float64(len(global))
 			}
@@ -188,24 +204,102 @@ func createPlot(global []MainData) {
 func main() {
 	url := flag.String("u", "", "Website url to benchmark")
 	amount := flag.Int("a", 3, "Iteration over requests (1 -> 100 requests, 2 -> 200 requests)")
+	is_multithreaded := flag.Bool("m", false, "Instead of sending requests one after another, send all at once")
 
 	flag.Parse()
+	if !*is_multithreaded {
+		var global []Data
 
-	var global []MainData
+		for i := 1; i <= *amount; i++ {
 
-	for i := 1; i <= *amount; i++ {
-		newData := MainData{}
+			data, err := process(i, *url)
+			if err != nil {
+				fmt.Println("Error during processing:", err)
 
-		data, err := process(i, *url)
-		if err != nil {
-			fmt.Println("Error during processing:", err)
-			continue
+				continue
+			}
+
+			global = append(global, Data{
+				Data:      data,
+				Iteration: i,
+				URL:       *url,
+			})
 		}
-		newData.Data = data
-		newData.Iteration = i
-		newData.Url = *url
-		global = append(global, newData)
+
+		createPlot(global)
+	} else {
+		maxRequests := measureMultithreadedRequests(*url)
+		fmt.Printf("MAximum concurrent requests before errors: %d\n", maxRequests)
+	}
+}
+
+func measureMultithreadedRequests(url string) int {
+	maxRequests := 0
+	increment := 10
+	for requests := increment; ; requests += increment {
+		results, err := sendMultithreadedRequests(requests, url)
+		if err != nil {
+			fmt.Printf("Error sending %d requests: %v\n", requests, err)
+			break
+		}
+
+		// Check if any response has a non-200 status code
+		hasNon200 := false
+		for _, r := range results {
+			if r.Code != http.StatusOK {
+				hasNon200 = true
+				break
+			}
+		}
+
+		if hasNon200 {
+			break
+		}
+
+		maxRequests = requests
+	}
+	return maxRequests
+}
+
+func sendMultithreadedRequests(numRequests int, url string) ([]Response, error) {
+	results := make([]Response, numRequests)
+	var wg sync.WaitGroup
+	wg.Add(numRequests)
+
+	for i := 0; i < numRequests; i++ {
+		go func(index int) {
+			defer wg.Done()
+			start := time.Now()
+			resp, err := http.Get(url)
+			if err != nil {
+				results[index] = Response{
+					TimeMillis: int(time.Since(start).Milliseconds()),
+					Code:       0, // Error code
+					Bytes:      0,
+					Date:       time.Now(),
+				}
+				return
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				results[index] = Response{
+					TimeMillis: int(time.Since(start).Milliseconds()),
+					Code:       resp.StatusCode,
+					Bytes:      0,
+					Date:       time.Now(),
+				}
+				return
+			}
+			results[index] = Response{
+				TimeMillis: int(time.Since(start).Milliseconds()),
+				Code:       resp.StatusCode,
+				Bytes:      len(body),
+				Date:       time.Now(),
+			}
+		}(i)
 	}
 
-	createPlot(global)
+	wg.Wait()
+	return results, nil
 }
